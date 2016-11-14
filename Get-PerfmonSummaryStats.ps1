@@ -1,6 +1,6 @@
 <#PSScriptInfo
 
-.VERSION 1.0.0
+.VERSION 1.0.1
 
 .GUID 8b95b4d6-fcef-488c-bf06-90462df15ac5
 
@@ -28,8 +28,8 @@
  Optional list of one or more target computers to send remote collection jobs to. If nothing is specified, the collection will be done locally.
 
 .PARAMETER Counter
- Optional list of one or more counters to inspect within the discovered .blg files. If nothing is specified (not recommended), all counters within the
- log will be inspected. Wildcards are permitted, and recommended.
+ Optional list of one or more counters to inspect within the discovered .blg files. If nothing is specified, all counters within the
+ log will be inspected. Wildcards are permitted.
 
 .PARAMETER MaxSamples
  Specifies the maximum number of samples of each counter in each log to import. Defaults to Unlimited.
@@ -60,7 +60,7 @@
  Specifies the FileName to use in the output when discovered counters are grouped by computer. Defaults to an empty string.
 
 .EXAMPLE
- >Performs a remote log analysis in path 'C:\PerfLogs' and inspects all counters in all logs. Not specifying any counters is not recommended for large log files, as the analysis could be very CPU and memory intensive.
+ >Performs a remote log analysis in path 'C:\PerfLogs' and inspects all counters in all logs found.
  PS> .\Get-PerfmonSummaryStats.ps1 -Path "C:\PerfLogs" -ComputerName "computer1","computer2" -Verbose
 
 .EXAMPLE
@@ -136,7 +136,7 @@ param
 function Get-PerfmonSummaryStatsLocal
 {
     [CmdletBinding()]
-    [OutputType([Object[]])]
+    [OutputType([System.Collections.Generic.List[System.Object]])]
     param
     (
         [parameter(Mandatory = $true)]
@@ -170,7 +170,7 @@ function Get-PerfmonSummaryStatsLocal
 
     Write-Verbose "$([DateTime]::Now): Entered Function Get-PerfmonSummaryStatsLocal"
 
-    [PSObject[]]$counterSummaries = @()
+    [System.Collections.Generic.List[System.Object]]$counterSummaries = New-Object System.Collections.Generic.List[System.Object]
 
     if (([string]::IsNullOrEmpty($DataCollectorName) -eq $false) -and ($RestartRunningDataCollector -eq $true -or $StartDataCollectorIfStopped -eq $true))
     {
@@ -239,83 +239,74 @@ function Get-PerfmonSummaryStatsLocal
 
                 Write-Verbose "$([DateTime]::Now): Importing and grouping counters from file $($file.FullName)"
 
+                [Object[]]$countersGrouped = $null
                 [Object[]]$countersGrouped = (Import-Counter @importParams).CounterSamples | Group-Object -Property Path
 
-                if ($null -ne $countersGrouped)
+                if ($countersGrouped.Count -gt 0)
                 {
-                    Write-Verbose "$([DateTime]::Now): Found $($countersGrouped.Count) unique counter groups"
+                    Write-Verbose "$([DateTime]::Now): Measuring $($countersGrouped.Count) unique counter paths"
 
                     foreach ($counterGroup in $countersGrouped)
                     {
-                        $counterPath = $counterGroup.Name
-                        [Object[]]$samples = $counterGroup.Group
+                        $measured = $counterGroup.Group | Measure-Object -Property CookedValue -Sum -Maximum -Minimum
 
-                        Write-Verbose "$([DateTime]::Now): Measuring counter group"
-
-                        $measured = $samples | Measure-Object -Property CookedValue -Sum -Maximum -Minimum
+                        $summary = New-Object PSObject -Property `
+                                                            @{
+                                                                Computer        = $counterGroup.Name.Substring(2, $counterGroup.Name.IndexOf('\',2) - 2).ToLower()
+                                                                CounterPath     = $counterGroup.Name.Substring($counterGroup.Name.IndexOf('\', 2)).ToLower()
+                                                                OldestTimestamp = $counterGroup.Group[0].Timestamp
+                                                                NewestTimestamp = $counterGroup.Group[-1].Timestamp
+                                                                Count           = $measured.Count
+                                                                Average         = [Decimal]0
+                                                                Maximum         = $measured.Maximum
+                                                                Minimum         = $measured.Minimum
+                                                                Sum             = $measured.Sum
+                                                                NumTicksDiff    = 0
+                                                                Frequency       = 0
+                                                                NumOpsDiff      = 0
+                                                                CounterType     = $counterGroup.Group[0].CounterType
+                                                                File            = $file.FullName
+                                                                Group           = ""
+                                                                MemberCount     = 1
+                                                            }
 
                         #Average calculation for Average counters taken from these references:
                             #https://msdn.microsoft.com/en-us/library/ms804010.aspx
                             #https://blogs.msdn.microsoft.com/ntdebugging/2013/09/30/performance-monitor-averages-the-right-way-and-the-wrong-way/
 
-                        [Decimal]$average = 0
-
-                        $numTicksDiff = 0
-                        $frequency = 0
-                        $numOpsDiff = 0
-
-                        if ($samples[0].CounterType -like "AverageTimer*")
+                        if ($summary.CounterType -like "AverageTimer*")
                         {
-                            $numTicksDiff = $samples[-1].RawValue - $samples[0].RawValue
-                            $frequency = $samples[-1].TimeBase
-                            $numOpsDiff = $samples[-1].SecondValue - $samples[0].SecondValue
+                            $summary.NumTicksDiff = $counterGroup.Group[-1].RawValue - $counterGroup.Group[0].RawValue
+                            $summary.Frequency = $counterGroup.Group[-1].TimeBase
+                            $summary.NumOpsDiff = $counterGroup.Group[-1].SecondValue - $counterGroup.Group[0].SecondValue
 
-                            if ($frequency -ne 0 -and $numOpsDiff -ne 0)
+                            if ($summary.Frequency -ne 0 -and $summary.NumOpsDiff -ne 0)
                             {
-                                [Decimal]$average = ($numTicksDiff / $frequency) / $numOpsDiff
+                                [Decimal]$summary.Average = ($summary.NumTicksDiff / $summary.Frequency) / $summary.NumOpsDiff
                             }                        
                         }
                         elseif ($measured.Count -ne 0)
                         {
-                            [Decimal]$average = $measured.Sum / $measured.Count
+                            [Decimal]$summary.Average = $measured.Sum / $measured.Count
                         }
 
-                        $summary = New-Object PSObject -Property `
-                                                            @{
-                                                                Computer        = $counterPath.Substring(2, $counterPath.IndexOf('\',2) - 2).ToLower()
-                                                                CounterPath     = $counterPath.Substring($counterPath.IndexOf('\', 2)).ToLower()
-                                                                OldestTimestamp = $samples[0].Timestamp
-                                                                NewestTimestamp = $samples[-1].Timestamp
-                                                                Count           = $measured.Count
-                                                                Average         = $average
-                                                                Maximum         = $measured.Maximum
-                                                                Minimum         = $measured.Minimum
-                                                                Sum             = $measured.Sum
-                                                                NumTicksDiff    = $numTicksDiff
-                                                                Frequency       = $frequency
-                                                                NumOpsDiff      = $numOpsDiff
-                                                                CounterType     = $samples[0].CounterType
-                                                                File            = $file.FullName
-                                                            }
-
-                        $counterSummaries += $summary
+                        $counterSummaries.Add($summary)
                     }
                 }
                 else
                 {
-                    Write-Warning "$([DateTime]::Now): Found 0 matching counters in file $($file.FullName)"
+                    Write-Verbose "$([DateTime]::Now): Found 0 matching counters in file $($file.FullName)"
                 }
             }
         }
     }
 
-    Write-Verbose "$([DateTime]::Now): Finished processing logs"
+    Write-Verbose "$([DateTime]::Now): Finished reading logs and getting initial counter summaries."
 
     if ($counterSummaries.Count -ne 0)
     {
         return ($counterSummaries | `
-                    Select-Object -Property Computer, CounterPath, OldestTimestamp, NewestTimestamp, Count, Average, Maximum, Minimum, Sum, NumTicksDiff, Frequency, NumOpsDiff, CounterType, File | `
-                    Sort-Object -Property Computer, CounterPath, OldestTimestamp, NewestTimestamp)
+                    Select-Object -Property Computer, CounterPath, OldestTimestamp, NewestTimestamp, Count, Average, Maximum, Minimum, Sum, NumTicksDiff, Frequency, NumOpsDiff, CounterType, File, Group, MemberCount)
     }
     else
     {
@@ -327,7 +318,7 @@ function Get-PerfmonSummaryStatsLocal
 function Get-PerfmonSummaryStatsRemote
 {
     [CmdletBinding()]
-    [OutputType([PSObject[]])]
+    [OutputType([System.Collections.Generic.List[System.Object]])]
     param
     (
         [parameter(Mandatory = $true)]
@@ -370,7 +361,7 @@ function Get-PerfmonSummaryStatsRemote
 
     Wait-Job $jobs | Out-Null
 
-    [PSObject[]]$allCounterSummaries = Receive-Job $jobs
+    [System.Collections.Generic.List[System.Object]]$allCounterSummaries = Receive-Job $jobs
 
     return $allCounterSummaries
 }
@@ -381,31 +372,39 @@ function Merge-SummaryGroup
     [CmdletBinding()]
     param
     (
-        [Object]
-        $SummaryGroup,
+        [String]
+        $GroupName,
+
+        [Object[]]
+        $Group,
 
         [String]
         $Computer,
 
         [String]
         $File
-    )
-      
-    $mergedSummary = New-Object PSObject -Property @{Computer=$Computer;CounterPath="";OldestTimestamp=$null;NewestTimestamp=$null;Count=[Decimal]0;Average=[Decimal]0;Maximum=[Decimal]0;Minimum=[Decimal]0;Sum=[Decimal]0;NumOpsDiff=[Decimal]0;CounterType="";File=$File;Group=$SummaryGroup.Name;MemberCount=[Decimal]0}
+    )        
 
-    [Object[]]$group = $SummaryGroup.Group
-
-    if ($group.Count -gt 0)
+    if ($Group.Count -gt 0)
     {
-        $mergedSummary.CounterPath = $group[0].CounterPath
-        $mergedSummary.Maximum = $group[0].Maximum
-        $mergedSummary.Minimum = $group[0].Minimum
-        $mergedSummary.OldestTimestamp = $group[0].OldestTimestamp
-        $mergedSummary.NewestTimestamp = $group[0].NewestTimestamp
-        $mergedSummary.CounterType = $group[0].CounterType
-        $mergedSummary.MemberCount = $group.Count
+        $mergedSummary = New-Object PSObject -Property @{
+                                                Computer=$Computer
+                                                CounterPath=$Group[0].CounterPath
+                                                OldestTimestamp=$Group[0].OldestTimestamp
+                                                NewestTimestamp=$Group[0].NewestTimestamp
+                                                Count=[Decimal]0
+                                                Average=[Decimal]0
+                                                Maximum=$Group[0].Maximum
+                                                Minimum=$Group[0].Minimum
+                                                Sum=[Decimal]0
+                                                NumOpsDiff=[Decimal]0
+                                                CounterType=$Group[0].CounterType
+                                                File=$File
+                                                Group=$GroupName
+                                                MemberCount=$Group.Count
+                                            }
 
-        foreach ($measurement in $group)
+        foreach ($measurement in $Group)
         {
             $mergedSummary.Count += $measurement.Count
             $mergedSummary.Sum += $measurement.Sum
@@ -433,11 +432,11 @@ function Merge-SummaryGroup
         }
 
         #If this is an average counter, we need to do a weighted average based on number of operations
-        if ($group[0].CounterType -like "Average*")
+        if ($Group[0].CounterType -like "Average*")
         {
             if ($mergedSummary.NumOpsDiff -ne 0)
             {
-                foreach ($measurement in $group)
+                foreach ($measurement in $Group)
                 {
                     $mergedSummary.Average += (($measurement.NumOpsDiff / $mergedSummary.NumOpsDiff) * $measurement.Average)
                 }
@@ -447,9 +446,11 @@ function Merge-SummaryGroup
         {
             $mergedSummary.Average = $mergedSummary.Sum / $mergedSummary.Count
         }
+
+        return $mergedSummary
     }
 
-    return $mergedSummary
+    return $null
 }
 
 #Merges the given counter summaries into related groups of:
@@ -459,10 +460,10 @@ function Merge-SummaryGroup
 function Get-SummariesMerged
 {
     [CmdletBinding()]
-    [OutputType([PSObject[]])]
+    [OutputType([System.Collections.Generic.List[System.Object]])]
     param
     (
-        [PSObject[]]
+        [System.Collections.Generic.List[System.Object]]
         $CounterSummaries,
 
         [String]
@@ -472,53 +473,65 @@ function Get-SummariesMerged
         $GroupedFileName
     )
 
-    [PSObject[]]$mergedSummaries = @()
-
-    foreach ($computerPathAndFileGroup in ($CounterSummaries | Group-Object -Property Computer, CounterPath, File))
-    {
-        $mergedSummaries += (Merge-SummaryGroup -SummaryGroup $computerPathAndFileGroup -Computer $computerPathAndFileGroup.Group[0].Computer -File $computerPathAndFileGroup.Group[0].File)
-    }
-
-    foreach ($computerAndPathGroup in ($CounterSummaries | Group-Object -Property Computer, CounterPath))
-    {
-        $mergedSummaries += (Merge-SummaryGroup -SummaryGroup $computerAndPathGroup -Computer $computerAndPathGroup.Group[0].Computer -File $GroupedFileName)
-    }
-
+    #Merge by CounterPath alone
     foreach ($counterPathGroup in ($CounterSummaries | Group-Object -Property CounterPath))
     {
-        $mergedSummaries += (Merge-SummaryGroup -SummaryGroup $counterPathGroup -Computer $GroupedComputerName -File $GroupedFileName)
+        $mergedCounterPathSummary = $null
+        $mergedCounterPathSummary = Merge-SummaryGroup -GroupName $counterPathGroup.Name -Group $counterPathGroup.Group -Computer $GroupedComputerName -File $GroupedFileName
+
+        if ($null -ne $mergedCounterPathSummary)
+        {
+            $CounterSummaries.Add($mergedCounterPathSummary)
+
+            #Merge by CounterPath and Computer
+            foreach ($computerAndPathGroup in ($counterPathGroup.Group | Group-Object -Property Computer))
+            {
+                $mergedComputerAndPathSummary = $null
+                $mergedComputerAndPathSummary = Merge-SummaryGroup -GroupName $computerAndPathGroup.Name -Group $computerAndPathGroup.Group -Computer $computerAndPathGroup.Group[0].Computer -File $GroupedFileName
+
+                if ($null -ne $mergedComputerAndPathSummary)
+                {
+                    $CounterSummaries.Add($mergedComputerAndPathSummary)
+                }
+            }
+        }
     }
 
-    if ($mergedSummaries.Count -ne 0)
+    if ($CounterSummaries.Count -ne 0)
     {
-        return ($mergedSummaries | `
+        return ($CounterSummaries | `
             Select-Object -Property Computer, CounterPath, OldestTimestamp, NewestTimestamp, Count, Average, Maximum, Minimum, Sum, NumOpsDiff, CounterType, File, Group, MemberCount | `
             Sort-Object -Property Computer, CounterPath, File)
     }
     else
     {
-        return $mergedSummaries
+        return $CounterSummaries
     }  
 }
 
 
 ### SCRIPT EXECUTION BEGINS HERE ###
 
+Write-Verbose "$([DateTime]::Now): Beginning script execution"
+
 if ($null -eq $ComputerName -or $ComputerName.Count -eq 0) #Do a collection against the local computer
 {    
-    $counterSummaries = Get-PerfmonSummaryStatsLocal -Path $Path -Counter $Counter -MaxSamples $MaxSamples -StartTime $StartTime -EndTime $EndTime -OnlyInspectFilesInDateRange $OnlyInspectFilesInDateRange -DataCollectorName $DataCollectorName -RestartRunningDataCollector $RestartRunningDataCollector -StartDataCollectorIfStopped $StartDataCollectorIfStopped -Verbose
+    [System.Collections.Generic.List[System.Object]]$counterSummaries = Get-PerfmonSummaryStatsLocal -Path $Path -Counter $Counter -MaxSamples $MaxSamples -StartTime $StartTime -EndTime $EndTime -OnlyInspectFilesInDateRange $OnlyInspectFilesInDateRange -DataCollectorName $DataCollectorName -RestartRunningDataCollector $RestartRunningDataCollector -StartDataCollectorIfStopped $StartDataCollectorIfStopped -Verbose
 }
 else #Do remote collections
 {
-    $counterSummaries = Get-PerfmonSummaryStatsRemote -Path $Path -ComputerName $ComputerName -Counter $Counter -MaxSamples $MaxSamples -StartTime $StartTime -EndTime $EndTime -OnlyInspectFilesInDateRange $OnlyInspectFilesInDateRange -DataCollectorName $DataCollectorName -RestartRunningDataCollector $RestartRunningDataCollector -StartDataCollectorIfStopped $StartDataCollectorIfStopped -Verbose
+    [System.Collections.Generic.List[System.Object]]$counterSummaries = Get-PerfmonSummaryStatsRemote -Path $Path -ComputerName $ComputerName -Counter $Counter -MaxSamples $MaxSamples -StartTime $StartTime -EndTime $EndTime -OnlyInspectFilesInDateRange $OnlyInspectFilesInDateRange -DataCollectorName $DataCollectorName -RestartRunningDataCollector $RestartRunningDataCollector -StartDataCollectorIfStopped $StartDataCollectorIfStopped -Verbose
 }
+
+[System.Collections.Generic.List[System.Object]]$mergedSummaries = New-Object System.Collections.Generic.List[System.Object]
 
 if ($counterSummaries.Count -gt 0)
 {
+    Write-Verbose "$([DateTime]::Now): Getting merged measurements for $($counterSummaries.Count) summaries"
+
     $mergedSummaries = Get-SummariesMerged -CounterSummaries $counterSummaries
-    return $mergedSummaries
 }
-else
-{
-    return
-}
+
+Write-Verbose "$([DateTime]::Now): Finished script execution"
+
+return $mergedSummaries
